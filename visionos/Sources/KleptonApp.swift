@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import CompositorServices
 import UIKit
+import WebKit
 import Network
 
 /// The local-network permission, asked for while a window can show the question.
@@ -279,6 +280,16 @@ struct KleptonApp: App {
             .defaultSize(width: 560, height: 240)
             .windowResizability(.contentSize)
 
+        // A web page the guest asked to open (see KLRun.watchKeyboard). One
+        // window per URL; closing it is the way back to the game. Never brought
+        // back at launch: visionOS restores the windows that were open when an
+        // app ended, and a web window restored ALONE meant the start window — the
+        // one that boots the game — never came up (DreamSpace, 2026-10-16).
+        WindowGroup(id: "web", for: URL.self) { $url in KleptonWebWindow(url: url) }
+            .defaultSize(width: 1100, height: 760)
+            .restorationBehavior(.disabled)
+            .defaultLaunchBehavior(.suppressed)
+
         ImmersiveSpace(id: SurrealAimGuide.spaceID) { KleptonSurrealAimSpace() }
             .immersionStyle(selection: .constant(.mixed), in: .mixed)
 
@@ -357,9 +368,31 @@ final class KLRun: ObservableObject {
                     kl_mono_set_text_input(0)
                     if !KbState.shared.open { self.openWindow?(id: "kbentry") }
                 }
+                // A web page the guest asked for (an Android VIEW intent, mapped in
+                // kl_jni_android's startActivity) opens in a window of OUR OWN
+                // ("web", KleptonWebWindow), not in Safari: handing it to Safari
+                // sent this app to the background, which ends it
+                // (KL_EXIT_ON_BACKGROUND) — DreamSpace closed the moment its
+                // Spotify button opened the page (2026-10-16). A window beside the
+                // immersive space keeps the game running behind it.
+                var buf = [CChar](repeating: 0, count: 2048)
+                if kl_mono_take_open_url(&buf, Int32(buf.count)) != 0,
+                   let s = String(validatingUTF8: buf), let url = URL(string: s),
+                   url.scheme?.lowercased() == "https" {   // kl_jni_web_url's rule, again
+                    NSLog("[app] opening \(s) in a web window")
+                    self.openWindow?(id: "web", value: url)
+                }
                 try? await Task.sleep(for: .milliseconds(200))
             }
         }
+    }
+}
+
+/// The guest's web page, in the system's own web view (visionOS 26).
+struct KleptonWebWindow: View {
+    let url: URL?
+    var body: some View {
+        WebView(url: url)
     }
 }
 

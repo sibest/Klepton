@@ -101,6 +101,14 @@ int  kl_mono_keycode_for_char(int ch);
 void kl_mono_set_text_input(int on);
 int  kl_mono_text_input_wanted(void);
 
+// A web page the guest asked to open — an Android intent turned into an https
+// URL (kl_jni_android's startActivity). Shared through here for the same reason
+// as the text-input flag: the frontend polls it and opens the page in a web
+// window of its own (KL_JNI_OPEN_URL). take copies the pending URL into `out`
+// and clears it; it returns 1 when there was one.
+void kl_mono_request_open_url(const char *url);
+int  kl_mono_take_open_url(char *out, int cap);
+
 // Deliver typed characters from the system keyboard to the guest as
 // SDL_TEXTINPUT (SDLInputConnection.nativeCommitText). Use this for text — not
 // kl_mono_key, whose key events do not fill an SDL text field. UTF-8; the

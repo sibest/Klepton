@@ -53,6 +53,26 @@ static int g_text_input_wanted;
 void kl_mono_set_text_input(int on)  { g_text_input_wanted = on ? 1 : 0; }
 int  kl_mono_text_input_wanted(void) { return g_text_input_wanted; }
 
+static pthread_mutex_t g_open_url_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_open_url[2048];
+void kl_mono_request_open_url(const char *url) {
+    if (!url || !*url) return;
+    pthread_mutex_lock(&g_open_url_mu);
+    snprintf(g_open_url, sizeof g_open_url, "%s", url);
+    pthread_mutex_unlock(&g_open_url_mu);
+}
+int kl_mono_take_open_url(char *out, int cap) {
+    int have = 0;
+    pthread_mutex_lock(&g_open_url_mu);
+    if (g_open_url[0] && out && cap > 0) {
+        snprintf(out, (size_t)cap, "%s", g_open_url);
+        g_open_url[0] = 0;
+        have = 1;
+    }
+    pthread_mutex_unlock(&g_open_url_mu);
+    return have;
+}
+
 // Committed text from the system keyboard. onNativeKeyDown/Up (kl_mono_key) is
 // the game-control path and does NOT produce SDL_TEXTINPUT — SDL's Android
 // backend takes typed CHARACTERS from the IME's SDLInputConnection.nativeCommit

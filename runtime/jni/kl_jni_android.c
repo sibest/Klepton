@@ -24,6 +24,7 @@
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
 #include "kl_egl.h"
+#include "../guest/kl_mono.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
 #include <zlib.h>
@@ -906,11 +907,262 @@ static klj_val klj_Canvas_init(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.l = self};
 }
 
+// What an outgoing intent names — its data URI and its target package — kept
+// beside the Intent object (whose `data` already holds the action) for the
+// intent startActivity then receives. A few slots: an app builds one intent at a
+// time.
+#define KLJ_INTENT_SLOTS 8
+static struct { void *obj; char uri[1024]; char pkg[256]; } g_intent_out[KLJ_INTENT_SLOTS];
+static unsigned g_intent_next;
+static pthread_mutex_t g_intent_mu = PTHREAD_MUTEX_INITIALIZER;
+static void klj_intent_note(void *obj, const char *uri, const char *pkg) {
+    if (!obj) return;
+    pthread_mutex_lock(&g_intent_mu);
+    int i = 0;
+    for (; i < KLJ_INTENT_SLOTS; i++) if (g_intent_out[i].obj == obj) break;
+    if (i == KLJ_INTENT_SLOTS) {
+        i = (int)(g_intent_next++ % KLJ_INTENT_SLOTS);
+        g_intent_out[i].obj = obj; g_intent_out[i].uri[0] = g_intent_out[i].pkg[0] = 0;
+    }
+    if (uri) snprintf(g_intent_out[i].uri, sizeof g_intent_out[i].uri, "%s", uri);
+    if (pkg) snprintf(g_intent_out[i].pkg, sizeof g_intent_out[i].pkg, "%s", pkg);
+    pthread_mutex_unlock(&g_intent_mu);
+}
+// The string an android/net/Uri or ComponentName made below carries, or NULL for
+// anything else (Uri.EMPTY, the launch Intent's ComponentName, a stray pointer).
+static const char *klj_obj_str(void *p, const char *cls) {
+    klj_object *o = klj_as_object(p);
+    return (o && !strcmp(o->cls, cls)) ? (const char *)o->data : NULL;
+}
 static klj_val klj_Intent_setPackage(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     const char *p = n > 0 ? klj_str(a[0].l) : NULL;
     KLJ_LOG("Intent.setPackage(\"%s\")", p ? p : "(null)");
+    klj_intent_note(self, NULL, p ? p : "");
     return (klj_val){.l = self};
+}
+// An explicit target: `new ComponentName(package, class)`, then
+// Intent.setComponent / setClassName. Only the package matters here (it is what
+// startActivity maps to a web page — DreamSpace's YouTube button goes this way,
+// 2026-10-16), so the object carries it.
+static klj_val klj_ComponentName_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *pkg = n > 0 ? klj_str(a[0].l) : NULL;
+    const char *cls = n > 1 ? klj_str(a[1].l) : NULL;
+    void *obj = kl_jni_new_object("android/content/ComponentName");
+    klj_as_object(obj)->data = pkg ? strdup(pkg) : NULL;
+    klj_own(obj, free);
+    KLJ_LOG("new ComponentName(\"%s\", \"%s\")", pkg ? pkg : "(null)", cls ? cls : "(null)");
+    return (klj_val){.l = obj};
+}
+static klj_val klj_Intent_setComponent(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *pkg = n > 0 ? klj_obj_str(a[0].l, "android/content/ComponentName") : NULL;
+    KLJ_LOG("Intent.setComponent(%s)", pkg ? pkg : "(null)");
+    if (pkg) klj_intent_note(self, NULL, pkg);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setClassName(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *pkg = n > 0 ? klj_str(a[0].l) : NULL;
+    const char *cls = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("Intent.setClassName(\"%s\", \"%s\")", pkg ? pkg : "(null)", cls ? cls : "(null)");
+    if (pkg) klj_intent_note(self, NULL, pkg);
+    return (klj_val){.l = self};
+}
+// Extras. A web address passed as one is taken as the page to open (a video
+// link, say); everything else is logged and dropped, as nothing reads it back.
+static klj_val klj_Intent_putExtraString(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    const char *v = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("Intent.putExtra(\"%s\", \"%s\")", k ? k : "(null)", v ? v : "(null)");
+    if (v && (!strncmp(v, "https://", 8) || !strncmp(v, "http://", 7))) klj_intent_note(self, v, NULL);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_putExtraScalar(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("Intent.putExtra(\"%s\", %lld)", k ? k : "(null)", n > 1 ? (long long)a[1].j : 0LL);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setFlags(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    KLJ_LOG("Intent.setFlags(0x%llx)", n > 0 ? (unsigned long long)a[0].j : 0ULL);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setAction(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    klj_object *o = klj_as_object(self);
+    if (o) o->data = s ? strdup(s) : NULL;   // what getAction reads
+    KLJ_LOG("Intent.setAction(\"%s\")", s ? s : "(null)");
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setData(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *u = n > 0 ? klj_obj_str(a[0].l, "android/net/Uri") : NULL;
+    KLJ_LOG("Intent.setData(%s)", u ? u : "(null)");
+    klj_intent_note(self, u ? u : "", NULL);
+    return (klj_val){.l = self};
+}
+// Uri.parse: an android/net/Uri carrying its string, which is all anything
+// here reads back (Intent.setData logs it).
+static klj_val klj_Uri_parse(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    void *obj = kl_jni_new_object("android/net/Uri");
+    klj_as_object(obj)->data = s ? strdup(s) : NULL;
+    klj_own(obj, free);
+    return (klj_val){.l = obj};
+}
+// There is no Android here to hand an intent to — no Meta browser, no Spotify,
+// no YouTube app. What CAN be honoured is a web page: an intent to VIEW one is
+// turned into an https URL and handed to the frontend, which opens it in a web
+// window of its own (kl_mono_request_open_url). Quest's own app links are
+// mapped to the web page of the same service — DreamSpace's Spotify button asks
+// the Meta browser for `ovrweb://pwa?packageName=com.spotify.horizon`. Anything
+// else does nothing and says so. (On Android an intent nobody can handle throws
+// ActivityNotFoundException; doing nothing is the gentler of the two for a guest
+// that does not catch it.)
+//   KL_JNI_OPEN_URL=0|1 — hand such a page to the frontend. Default 1 for
+//       DreamSpace (x9449316705178989), else 0: every other guest's intent is
+//       logged and refused, as before. Only https pages on the hosts below
+//       (kl_jni_web_url) are handed over.
+static int klj_open_url_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_JNI_OPEN_URL", t && !strcmp(t, "x9449316705178989"));
+    }
+    return on;
+}
+// What may be opened: https only (an http address is upgraded), on a host that
+// is one of these or under one of them — the services DreamSpace's buttons
+// lead to (Spotify, YouTube and Google's sign-in for it, the Meta browser's
+// start page) and Meta's own sites. Anything else is refused: the address
+// comes from the guest, and the window is ours. Writes the address to open into
+// `out` and returns 1, or returns 0 with the reason in `why`.
+static const char *const g_web_hosts[] = {
+    "spotify.com", "youtube.com", "youtu.be", "google.com",
+    "meta.com", "oculus.com", "facebook.com",
+};
+int kl_jni_web_url(const char *in, char *out, size_t cap, const char **why) {
+    const char *dummy;
+    if (!why) why = &dummy;
+    *why = NULL;
+    if (!in || !out || cap == 0) { *why = "no address"; return 0; }
+    const char *rest;
+    if (!strncasecmp(in, "https://", 8))     rest = in + 8;
+    else if (!strncasecmp(in, "http://", 7)) rest = in + 7;     // upgraded below
+    else { *why = "not an http(s) address"; return 0; }
+    // The host: up to the path, query, fragment or port. A user part
+    // ("spotify.com@elsewhere") would make the host something else than it reads.
+    size_t hl = strcspn(rest, "/?#:");
+    if (memchr(rest, '@', strcspn(rest, "/?#"))) { *why = "address carries a user part"; return 0; }
+    if (hl == 0 || hl >= 256) { *why = "no host"; return 0; }
+    char host[256];
+    for (size_t i = 0; i < hl; i++) {
+        host[i] = (char)tolower((unsigned char)rest[i]);
+        // A plain name only: no escapes, backslashes or anything a browser
+        // might read as the end of the host where this does not.
+        if (!isalnum((unsigned char)host[i]) && host[i] != '.' && host[i] != '-') {
+            *why = "host is not a plain name"; return 0;
+        }
+    }
+    host[hl] = 0;
+    if (host[hl - 1] == '.') host[--hl] = 0;                  // "youtube.com."
+    int ok = 0;
+    for (size_t k = 0; k < sizeof g_web_hosts / sizeof g_web_hosts[0] && !ok; k++) {
+        size_t dl = strlen(g_web_hosts[k]);
+        ok = hl == dl ? !strcmp(host, g_web_hosts[k])
+           : hl > dl && host[hl - dl - 1] == '.' && !strcmp(host + hl - dl, g_web_hosts[k]);
+    }
+    if (!ok) { *why = "host not on the list"; return 0; }
+    int w = snprintf(out, cap, "https://%s", rest);
+    if (w < 0 || (size_t)w >= cap) { *why = "address too long"; return 0; }
+    return 1;
+}
+static const struct { const char *pkg, *url; } g_web_for_pkg[] = {
+    { "com.spotify.horizon",                       "https://open.spotify.com/" },
+    { "com.spotify.music",                         "https://open.spotify.com/" },
+    { "com.google.android.apps.youtube.vr.oculus", "https://www.youtube.com/" },
+    { "com.google.android.youtube",                "https://www.youtube.com/" },
+    { "com.youtube.horizon",                       "https://www.youtube.com/" },
+    // Meta's browser opened without a page: its start page, here a search page.
+    { "com.oculus.browser",                        "https://www.google.com/" },
+};
+static const char *klj_web_for_pkg(const char *p) {
+    if (!p || !*p) return NULL;
+    for (size_t i = 0; i < sizeof g_web_for_pkg / sizeof g_web_for_pkg[0]; i++)
+        if (!strcmp(p, g_web_for_pkg[i].pkg)) return g_web_for_pkg[i].url;
+    return NULL;
+}
+// A query parameter's value (no percent-decoding needed for the ones read here
+// except url=, which is decoded).
+static int klj_query_param(const char *uri, const char *key, char *out, size_t cap) {
+    const char *q = strchr(uri, '?');
+    size_t kl = strlen(key);
+    for (const char *p = q; p && *p; ) {
+        p++;
+        if (!strncmp(p, key, kl) && p[kl] == '=') {
+            const char *v = p + kl + 1;
+            size_t o = 0;
+            for (; *v && *v != '&' && o + 1 < cap; v++) {
+                if (*v == '%' && isxdigit((unsigned char)v[1]) && isxdigit((unsigned char)v[2])) {
+                    char h[3] = { v[1], v[2], 0 };
+                    out[o++] = (char)strtol(h, NULL, 16); v += 2;
+                } else out[o++] = *v;
+            }
+            out[o] = 0;
+            return o > 0;
+        }
+        p = strchr(p, '&');
+    }
+    return 0;
+}
+static klj_val klj_Context_startActivity(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    void *intent = n > 0 ? a[0].l : NULL;
+    const char *act = klj_obj_str(intent, "android/content/Intent");
+    char uri[1024] = "", pkg[256] = "", web[2048] = "";
+    pthread_mutex_lock(&g_intent_mu);
+    for (int i = 0; i < KLJ_INTENT_SLOTS; i++)
+        if (intent && g_intent_out[i].obj == intent) {
+            snprintf(uri, sizeof uri, "%s", g_intent_out[i].uri);
+            snprintf(pkg, sizeof pkg, "%s", g_intent_out[i].pkg);
+            g_intent_out[i].obj = NULL;   // started: a recycled object starts clean
+        }
+    pthread_mutex_unlock(&g_intent_mu);
+    int view = act && !strcmp(act, "android.intent.action.VIEW");
+    if (view && (!strncmp(uri, "https://", 8) || !strncmp(uri, "http://", 7))) {
+        snprintf(web, sizeof web, "%s", uri);
+    } else if (view && !strncmp(uri, "ovrweb://", 9)) {
+        char v[1024];
+        if (klj_query_param(uri, "url", v, sizeof v) &&
+            (!strncmp(v, "https://", 8) || !strncmp(v, "http://", 7)))
+            snprintf(web, sizeof web, "%s", v);
+        else if (klj_query_param(uri, "packageName", v, sizeof v) && klj_web_for_pkg(v))
+            snprintf(web, sizeof web, "%s", klj_web_for_pkg(v));
+    } else if (klj_web_for_pkg(pkg)) {
+        snprintf(web, sizeof web, "%s", klj_web_for_pkg(pkg));
+    }
+    char page[2048];
+    const char *why = NULL;
+    if (web[0] && klj_open_url_on() && kl_jni_web_url(web, page, sizeof page, &why)) {
+        KLJ_LOG("startActivity(%s %s, package %s) -> opening %s in a web window",
+                act ? act : "(null)", uri[0] ? uri : "(no data)", pkg[0] ? pkg : "-", page);
+        kl_mono_request_open_url(page);
+    } else if (why) {
+        KLJ_LOG("startActivity(%s %s, package %s) — refused to open %s: %s",
+                act ? act : "(null)", uri[0] ? uri : "(no data)", pkg[0] ? pkg : "-", web, why);
+    } else {
+        KLJ_LOG("startActivity(%s %s, package %s) — refused: no other app to open on this host%s",
+                act ? act : "(null)", uri[0] ? uri : "(no data)", pkg[0] ? pkg : "-",
+                web[0] ? " (KL_JNI_OPEN_URL is off)" : "");
+    }
+    return (klj_val){.j = 0};
 }
 static klj_val klj_Intent_addFlags(void *env, void *self, const klj_val *a, int n) {
     (void)env;
@@ -1879,6 +2131,19 @@ const klj_binding klj_bind_android[] = {
 
     {"android/content/Intent", "setPackage",  "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setPackage},
     {"android/content/Intent", "addFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_addFlags},
+    {"android/content/Intent", "<init>",      "()V",                                         klj_Intent_init},
+    {"android/content/Intent", "setAction",   "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setAction},
+    {"android/content/Intent", "setFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_setFlags},
+    {"android/content/ComponentName", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V",   klj_ComponentName_init},
+    {"android/content/Intent", "setComponent", "(Landroid/content/ComponentName;)Landroid/content/Intent;", klj_Intent_setComponent},
+    {"android/content/Intent", "setClassName", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setClassName},
+    {"android/content/Intent", "putExtra", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_putExtraString},
+    {"android/content/Intent", "putExtra", "(Ljava/lang/String;I)Landroid/content/Intent;",  klj_Intent_putExtraScalar},
+    {"android/content/Intent", "putExtra", "(Ljava/lang/String;Z)Landroid/content/Intent;",  klj_Intent_putExtraScalar},
+    {"android/content/Intent", "setData",     "(Landroid/net/Uri;)Landroid/content/Intent;",  klj_Intent_setData},
+    {"android/net/Uri",        "parse",       "(Ljava/lang/String;)Landroid/net/Uri;",        klj_Uri_parse},
+    {"android/content/Context", "startActivity", "(Landroid/content/Intent;)V",              klj_Context_startActivity},
+    {"android/app/Activity",    "startActivity", "(Landroid/content/Intent;)V",              klj_Context_startActivity},
     {"android/content/Intent", "toUri",       "(I)Ljava/lang/String;",                       klj_Intent_toUri},
     {"android/content/Context", "getPackageManager", "()Landroid/content/pm/PackageManager;", klj_Context_getPackageManager},
     {"android/content/Context", "getPackageName", "()Ljava/lang/String;", klj_Context_getPackageName},

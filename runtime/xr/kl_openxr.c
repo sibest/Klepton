@@ -1934,6 +1934,15 @@ static void klxr_report_frames(FILE *f) {
     }
 }
 
+int kl_openxr_native_handles(uint64_t *instance, uint64_t *session) {
+    if (g_instance.magic != KLXR_MAGIC_INSTANCE || g_session.magic != KLXR_MAGIC_SESSION)
+        return 0;
+    *instance = (uint64_t)(uintptr_t)&g_instance;
+    *session  = (uint64_t)(uintptr_t)&g_session;
+    return 1;
+}
+void *kl_openxr_get_instance_proc_addr(void) { return (void *)klxr_GetInstanceProcAddr; }
+
 static klxr_session *klxr_sess(void *h) {
     klxr_session *s = (klxr_session *)h;
     return (s && s->magic == KLXR_MAGIC_SESSION) ? s : NULL;
@@ -2425,7 +2434,16 @@ static XrResult klxr_RequestExitSession(void *session) {
 // caller testing `result == XR_SUCCESS` rather than `>= 0` reads an empty queue
 // as an event. That is the guest's business, but it is why this returns the
 // specified code rather than an error.
+static XrResult klxr_PollEvent_inner(void *instance, XrEventDataBuffer *data);
+// Every event handed out is also forwarded to the handlers a guest registered
+// with OVRPlugin (kl_ovrp_dispatch_openxr_event) — what the real plugin's
+// xrPollEvent hook does on Meta's OpenXR backend.
 static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
+    XrResult r = klxr_PollEvent_inner(instance, data);
+    if (r == KLXR_SUCCESS) kl_ovrp_dispatch_openxr_event(data);
+    return r;
+}
+static XrResult klxr_PollEvent_inner(void *instance, XrEventDataBuffer *data) {
     KLXR_TRACE("xrPollEvent");
     if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (!data) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
